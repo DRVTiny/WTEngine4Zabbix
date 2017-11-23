@@ -1,4 +1,5 @@
 package Zabbix::Sender::Clever;
+use utf8;
 use Data::Dumper;
 use feature 'say';
 use Moose;
@@ -22,9 +23,10 @@ sub send {
   printf STDERR "Feeding item <<%s>> on host <<%s>> with value <<%s>>\n", 
                 $item->{'key'}, $self->hostname, $item->{'val'} 
     if $self->debug;
+  utf8::decode($item->{'val'}) unless utf8::is_utf8($item->{'val'});
   unless ($self->dryrun) {
-    $self->SUPER::send(@_);
-    say 'INFO: '.$self->_info if $self->debug;
+    $self->SUPER::send(@{$item}{'key','val'});
+    printf("INFO[%s]: %s\n", $self->hostname, $self->_info) if $self->debug;
   }  
 }
 

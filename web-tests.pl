@@ -22,6 +22,7 @@ use constant {
   WT_STEPS_DISCOVERY_FMT=>q(wt["%s"].steps),
   USER_AGENT_CONN_TIMEOUT=>30,
   USER_AGENT_INACT_TIMEOUT=>40,
+  USER_AGENT_REQ_TIMEOUT_INDEFINITE=>0,
   FL_WIDE_UTF8_TO_BYTES=>0,
 };
 
@@ -123,10 +124,12 @@ sub run_tests {
   my ($siteConf,$pars)=((map decode_cbor($_), @_),{},{});
   my $where={'host'=>$siteConf->{'host'}};
   $DEBUG=$pars->{'debug'};
+  my $VERBOSE=$pars->{'verbose'};
   try {
     my $ua=Mojo::UserAgent->new;
-    $ua->connect_timeout(USER_AGENT_CONN_TIMEOUT);
-    $ua->inactivity_timeout(USER_AGENT_INACT_TIMEOUT);
+    $ua->connect_timeout( $siteConf->{'connect_timeout'} // USER_AGENT_CONN_TIMEOUT );
+    $ua->inactivity_timeout( $siteConf->{'inact_timeout'} // USER_AGENT_INACT_TIMEOUT );
+    $ua->request_timeout( $siteConf->{'req_timeout'} // USER_AGENT_REQ_TIMEOUT_INDEFINITE );
     my $Z=Zabbix::Sender::Clever->new(
       'server'=>$pars->{'server'},
       'debug'=>$pars->{'debug'},
@@ -138,7 +141,7 @@ sub run_tests {
       my $url=$macro{'BASE_URL'}=$siteConf->{'url'};
       if (my ($flUseSSL,$urlHost,$urlPortExpl)=$url=~m%^\s*http(s?)://(?:[^/@]+@)?([^/:]+)(?::(\d+))?$%i) {
         my $portNumber=$urlPortExpl || ($flUseSSL?443:80);
-        my $pinger=Net::Ping->new();
+        my $pinger=Net::Ping->new('tcp' => $ua->connect_timeout);
         $pinger->port_number($portNumber);
         my $flHostAccessible=$pinger->ping($urlHost);
         $Z->send('web.tcp.reachable', $flHostAccessible?1:0);
@@ -211,25 +214,28 @@ sub run_tests {
           %extracts=(%extracts, extract_vars($resBody, $wtStep->{'extract'}));
 #          dbg_ $where, 'Extracts: '.Dumper(\%extracts);
         }
-        last unless ( $wtResult->{$stepName}{'val'}=
+        last unless $wtResult->{$stepName}{'ok'}=( $wtResult->{$stepName}{'val'}=
           $wtStep->{'checks'}
             ? run_content_checks($wtStep->{'checks'},$res)
             : (($wtStep->{'code'} and $res->code and $res->code eq $wtStep->{'code'}) or (!$wtStep->{'code'} and $res->is_success))
               ? 'OK'
-              : 'ERROR '.$res->code.($res->message?': '.$res->message:'') ) eq 'OK';
+              : 'ERROR '.$res->code.($res->message?': '.$res->message:'') ) eq 'OK' ? 1 : 0;
         utf8::encode($wtResult->{$stepName}{'val'}) if FL_WIDE_UTF8_TO_BYTES;
       }
       $wtResult->{$_->{'name'}}{'val'}='UNKNOWN' for @wtSteps[($step_n+1)..$#wtSteps];
       $wtAllRes{$wt->{'name'}}=$wtResult;
     }
-    delete @{$where}{'test','step'};
-    
+    delete @{$where}{qw/test step/};
+    my $tsNow=int(time);
     while (my ($wtName, $wtRes)=each %wtAllRes) {
       while (my ($wtStepName, $wtStepRes)=each %{$wtRes}) {
-        $Z->send(sprintf(WT_STEP_KEY_FMT, $_, $wtName, $wtStepName), $wtStepRes->{$_})
-          for grep defined $wtStepRes->{$_}, qw(time val);
+        $Z->bulk_buf_add([sprintf(WT_STEP_KEY_FMT, $_, $wtName, $wtStepName), $wtStepRes->{$_}, $tsNow])
+          for grep defined $wtStepRes->{$_}, qw(ok time val);
       }
     }
+    $Z->bulk_send if @{$Z->bulk_buf};
+    say join(': ', $siteConf->{'host'}, $Z->_info) if $VERBOSE || $DEBUG;
+    $Z->bulk_buf_clear;
   } catch {
     croak 'Catched error when run_tests(): '.$_;
   };
@@ -306,9 +312,9 @@ my ($opts, $usage) = describe_options(
 );
  
 print($usage->text), exit if $opts->help;
-my ($flDebug,$flTest,$flVerbose)=($opts->debug,$opts->dryrun,$opts->verbose);
+my ($flDebug, $flTest, $flVerbose) = ($opts->debug, $opts->dryrun, $opts->verbose);
 
-$ENV{'MOJO_USERAGENT_DEBUG'}=($flDebug || $flVerbose)?1:0;
+$ENV{'MOJO_USERAGENT_DEBUG'}=($flDebug || $flVerbose) ? 1 : 0;
 
 die 'You couldnot specify both --checksfile and --checksdir' if $opts->checksfile && $opts->checksdir;
 my %checks=$opts->checksfile
@@ -335,6 +341,7 @@ while (my ($siteName, $siteCheck)=each %checks) {
     ->send_arg(encode_cbor {
       'server'=>$zbxServer,
       'debug'=>$flDebug?1:0,
+      'verbose'=>$flVerbose?1:0,
       'dryrun'=>$opts->dryrun?1:0,
     })
     ->run('WT::'.$what2do,
