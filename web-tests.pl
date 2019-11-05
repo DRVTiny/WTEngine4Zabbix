@@ -4,7 +4,7 @@ use 5.16.1;
 use strict;
 use utf8;
 use Data::Dumper;
-use Net::Curl::Easy qw(/^CURLOPT_/ /^CURLINFO_/);
+use Mojo::UserAgent;
 use CBOR::XS qw(encode_cbor decode_cbor);
 use Zabbix::Sender::Clever;
 use JSON::XS;
@@ -15,22 +15,33 @@ use Time::HiRes qw(time);
 use Carp qw(croak carp);
 
 use constant {
-  WT_SUCCESS			=>	0,
-  WT_FAILED			=>	1,
-  WT_UNKNOWN			=>	2,
-  WT_STEP_KEY_FMT		=>	q(wt_step_%s["%s","%s"]),
-  WT_STEPS_DISCOVERY_FMT	=>	q(wt["%s"].steps),
-  USER_AGENT_CONN_TIMEOUT	=>	30,
-  USER_AGENT_INACT_TIMEOUT	=>	40,
-  USER_AGENT_REQ_TIMEOUT_INDEFINITE=>	0,
-  USER_AGENT_UNLIM_REDIRECTS	=>	-1,
-  FL_WIDE_UTF8_TO_BYTES		=>	0,
+  WT_SUCCESS		 =>  0,
+  WT_FAILED		 =>  1,
+  WT_STEP_STATUS_SUCCESS =>  1,
+  WT_STEP_STATUS_FAILURE =>  0,
+  WT_STEP_STATUS_UNKNOWN =>  2,
+  WT_UNKNOWN		 =>  2,
+  WT_STEP_KEY_FMT	 =>  q<wt_step_%s["%s","%s"]>,
+  WT_STEPS_DISCOVERY_FMT =>  q<wt["%s"].steps>,
+  USER_AGENT_CONN_TIMEOUT  => 30,
+  USER_AGENT_INACT_TIMEOUT => 40,
+  USER_AGENT_REQ_TIMEOUT_INDEFINITE => 0,
+  FL_WIDE_UTF8_TO_BYTES	   => 0,
+  TCP_PORT_HTTPS	=> 443,
+  TCP_PORT_HTTP		=> 80,
 };
 
 my %webChecks;
 
 sub jsdump {
   say STDERR JSON::XS->new->pretty->encode(ref($_[0])?$_[0]:[$_[0]]);
+}
+
+sub doPrepareSSLConnection {
+  my ($ua, $sslConf) = @_;
+  $ua->ca( $sslConf->{'ca_cert'} ) 	 if $sslConf->{'ca_cert'};
+  $ua->cert( $sslConf->{'client_cert'} ) if $sslConf->{'client_cert'};
+  $ua->key( $sslConf->{'client_key'} ) 	 if $sslConf->{'client_key'};
 }
 
 sub run_content_checks {
@@ -112,90 +123,79 @@ sub extract_vars {
 }
 
 sub run_tests {
-  state $dfltCURLOpts={
-    CURLOPT_FOLLOWLOCATION() => 1,
-    CURLOPT_TIMEOUT() => USER_AGENT_REQ_TIMEOUT_INDEFINITE,
-    CURLOPT_CONNECTTIMEOUT() => USER_AGENT_CONN_TIMEOUT,
-    CURLOPT_LOW_SPEED_TIME() => 30,  # during 30 sec.
-    CURLOPT_LOW_SPEED_LIMIT() => 256, # speed is 2 kbit/sec
-    CURLOPT_MAXREDIRS() => USER_AGENT_UNLIM_REDIRECTS,
-  };
-  state $optsRedefDefault={
-    'connect_timeout' 	=> CURLOPT_CONNECTTIMEOUT(),
-    'req_timeout'	=> CURLOPT_TIMEOUT(),
-    'redirects'		=> CURLOPT_MAXREDIRS(),
-  };
+  my $fh=shift;
+  close $fh;
   
-  my $fh=shift; close $fh;  
   my ($siteConf,$pars)=((map decode_cbor($_), @_),{},{});
-  
   my $where={'host'=>$siteConf->{'host'}};
-  $DEBUG=$pars->{'debug'};
+  $ENV{MOJO_CLIENT_DEBUG}=1 if $DEBUG=$pars->{'debug'};
   my $VERBOSE=$pars->{'verbose'};
   try {
-    my $ua=Net::Curl::Easy->new;
-    my %reqOpts=%{$dfltCURLOpts};
-    {
-      my @opts=grep defined($siteConf->{$_}), keys $optsRedefDefault;
-      @reqOpts{@{$optsRedefDefault}{@opts}}=@{$siteConf}{@opts};
-    }
-    my $Z=Zabbix::Sender::Clever->new(
-      'server'=>$pars->{'server'},
-      'debug'=>$pars->{'debug'},
-      'dryrun'=>$pars->{'dryrun'},
-      'hostname'=>$siteConf->{'host'}
+    my $ua = Mojo::UserAgent->new;
+    $ua->connect_timeout( $siteConf->{'connect_timeout'} // USER_AGENT_CONN_TIMEOUT );
+    $ua->inactivity_timeout( $siteConf->{'inact_timeout'} // USER_AGENT_INACT_TIMEOUT );
+    $ua->request_timeout( $siteConf->{'req_timeout'} // USER_AGENT_REQ_TIMEOUT_INDEFINITE );
+    my $Z = Zabbix::Sender::Clever->new(
+      'server'		=> $pars->{'server'},
+      'debug'		=> $pars->{'debug'},
+      'dryrun'		=> $pars->{'dryrun'},
+      'hostname'	=> $siteConf->{'host'}
     );
     my %macro;
-    if ($siteConf->{'url'}) {
-      my $url=$macro{'BASE_URL'}=$siteConf->{'url'};
-      if (my ($flUseSSL,$urlHost,$urlPortExpl)=$url=~m%^\s*http(s?)://(?:[^/@]+@)?([^/:]+)(?::(\d+))?$%i) {
-        my $portNumber=$urlPortExpl || ($flUseSSL?443:80);
-        my $pinger=Net::Ping->new('tcp' => $reqOpts{CURLOPT_CONNECTTIMEOUT()});
+    if ( $siteConf->{'url'} ) {
+      my $url = $macro{'BASE_URL'} = $siteConf->{'url'};
+      if ( my ($flUseSSL, $urlHost, $urlPortExpl) = $url=~m%^\s*http(s?)://(?:[^/@]+@)?([^/:]+)(?::(\d+))?$%i ) {
+        my $portNumber = $urlPortExpl || ($flUseSSL ? TCP_PORT_HTTPS : TCP_PORT_HTTP);
+        my $pinger=Net::Ping->new('tcp' => $ua->connect_timeout);
         $pinger->port_number($portNumber);
-        my $flHostAccessible=$pinger->ping($urlHost);
-        $Z->send('web.tcp.reachable', $flHostAccessible?1:0);
-        return unless $flHostAccessible;
+        my $flHostAccessible = $pinger->ping($urlHost);
+        $Z->send('web.tcp.reachable', $flHostAccessible ? 1 : 0);
+        unless ( $flHostAccessible ) {
+          say "ERROR: host $urlHost is not TCP-reachable, connection refused" if $pars->{'debug'};
+          return
+        }
       }
     }
-    if ($siteConf->{'ssl'}) {
-      @reqOpts{CURLOPT_SSLCERT(), CURLOPT_SSLKEY()}=@{$siteConf->{'ssl'}}{qw/client_cert client_key/};
-      $reqOpts{CURLOPT_CAPATH()} = $siteConf->{'ca_path'} // $siteConf->{'ca_cert'}=~s%/+[^/]+$%%r;
-    }
+    doPrepareSSLConnection($ua, $siteConf->{'ssl'}) if $siteConf->{'ssl'};
     my %wtAllRes;
     for my $wt (grep { !exists($_->{'enable'}) or $_->{'enable'} } @{$siteConf->{'tests'}}) {
-      @{$where}{qw(test step)}=($wt->{'name'},undef);
-      my @wtSteps=@{$wt->{'steps'}};
-      my $step_n=0;
-      my $wtResult={};
+      @{$where}{qw(test step)}=($wt->{'name'}, undef);
+      my @wtSteps = @{$wt->{'steps'}};
+      my $step_n = 0;
+      my $wtResult = {};
       my %extracts;
       WT_STEPS:
-      for (;$step_n<=$#wtSteps;$step_n++) {
-        my $wtStep=$wtSteps[$step_n];
-        my $stepName=$where->{'step'}=$wtStep->{'name'};
+      for ( ; $step_n <= $#wtSteps; $step_n++ ) {
+        my $wtStep = $wtSteps[$step_n];
+        my $stepName = $where->{'step'} = $wtStep->{'name'};
         
-        my $oldUARedirects=
-          ( defined $wtStep->{'redirects'} and eval { $wtStep->{'redirects'} =~ /^\d+$/ } )
-            ? do { $_=$reqOpts{CURLOPT_MAXREDIRS()}; dbg_ $where, 'Setting number of redirects to %d', $reqOpts{CURLOPT_MAXREDIRS()}=$wtStep->{'redirects'}; $_ }
-            : undef;
+        my $oldUARedirects = ( defined $wtStep->{'redirects'} and eval { $wtStep->{'redirects'} =~ /^\d+$/ } )
+          ? do { $_=$ua->max_redirects;
+                 dbg_ $where, 'Setting number of redirects to %d', my $n = $wtStep->{'redirects'};
+                 $ua->max_redirects($n);
+                 $_
+              }
+          : undef;
 
-        my $url=$wtStep->{'url'};
+        my $url = $wtStep->{'url'} // $siteConf->{'url'};
         macro_subst($url,\%macro);
-        
-        unless ($wtStep->{'method'} and ! ref($wtStep->{'method'}) and $wtStep->{'method'}=~m/(?:P(?:OST|UT|ATCH)|GET|HEAD|DELETE)/i) {
-          exists($wtStep->{$_}) and defined($wtStep->{$_}) and $wtStep->{'method'}=uc($_), last for qw/get post put head delete patch/;
-        }
-        
-        my $reqMethod=$wtStep->{'method'} || 'GET';
-        dbg_ $where, "Used request method: $reqMethod";
-        
-        
-        my $stepStart=time;
-        my $tx=$ua->start($ua->build_tx(
-            $reqMethod => $url,
+        do {
+          for (qw(get post put head delete patch)) {
+            do { 
+              $wtStep->{'method'} = uc $_;
+              last
+            } if exists $wtStep->{$_} and defined $wtStep->{$_}
+          }
+        } unless $wtStep->{'method'} and ! ref($wtStep->{'method'}) and $wtStep->{'method'}=~m/(?:P(?:OST|UT|ATCH)|GET|HEAD|DELETE)/i;
+        my $rqMethod = $wtStep->{'method'} || 'GET';
+        dbg_ $where, "Used request method: $rqMethod";
+        my $stepStart = time;
+        my $tx = $ua->start( $ua->build_tx(
+            $rqMethod => $url,
             $wtStep->{'headers'}?($wtStep->{'headers'}):(),
-            (exists $wtStep->{lc $reqMethod} and ref($wtStep->{lc $reqMethod}) eq 'HASH')
+            (exists $wtStep->{lc $rqMethod} and ref($wtStep->{lc $rqMethod}) eq 'HASH')
               ? do {
-                  if (my $frm=$wtStep->{lc $reqMethod}{'form'}) {
+                  if (my $frm=$wtStep->{lc $rqMethod}{'form'}) {
                     for ( grep /\<\</, values %{$frm} ) {
 #                      say 'Before macro '.$_;
                       macro_subst($_, \%extracts, '<<');
@@ -203,42 +203,63 @@ sub run_tests {
                     }
                     dbg_ $where, 'Sending form: %s', Dumper($frm);
                   }
-                  %{$wtStep->{lc $reqMethod}}
+                  %{$wtStep->{lc $rqMethod}}
                 }
               : (),
         ));
-        my $err=$tx->error;
-        if ($err and !(($err->{'code'} and $wtStep->{'code'}==$err->{'code'}) or $wtStep->{'error_expected'})) {
-          $wtResult->{$stepName}{'val'}='ERROR '.join(': '=>grep defined, @{$err}{qw/code message/});
+        my $err = $tx->error;
+        if ($err and !(($err->{'code'} and $wtStep->{'code'} == $err->{'code'}) or $wtStep->{'error_expected'})) {
+          @{ $wtResult->{$stepName} }{qw<val ok>} = (
+            my $erm = 'ERROR '.join(': ' => grep defined, @{$err}{qw/code message/}),
+            WT_STEP_STATUS_FAILURE,
+          );
+          say STDERR $erm if $pars->{'debug'};
           last WT_STEPS
         }
-        my $res=eval { $tx->result };
-        my $stepFin=time;
-        $wtResult->{$stepName}={
-          'time'=>$stepFin>$stepStart?nearest(1,($stepFin-$stepStart)*1000):-1
+        my $res = eval { $tx->result };
+        my $stepFin = time;
+        $wtResult->{$stepName} = {
+          'time' => $stepFin > $stepStart ? nearest(1, ($stepFin - $stepStart) * 1000) : -1
         };
         $ua->max_redirects($oldUARedirects) if $oldUARedirects;
-        if ( $res and (my $resBody=eval { $res->body }) and $wtStep->{'extract'} ) {
-          %extracts=(%extracts, extract_vars($resBody, $wtStep->{'extract'}));
+        if ( $res and (my $resBody = eval { $res->body }) and $wtStep->{'extract'} ) {
+          %extracts = (%extracts, extract_vars($resBody, $wtStep->{'extract'}));
 #          dbg_ $where, 'Extracts: '.Dumper(\%extracts);
         }
-        last unless $wtResult->{$stepName}{'ok'}=( $wtResult->{$stepName}{'val'}=
-          $wtStep->{'checks'}
-            ? run_content_checks($wtStep->{'checks'},$res)
-            : (($wtStep->{'code'} and $res->code and $res->code eq $wtStep->{'code'}) or (!$wtStep->{'code'} and $res->is_success))
-              ? 'OK'
-              : 'ERROR '.$res->code.($res->message?': '.$res->message:'') ) eq 'OK' ? 1 : 0;
-        utf8::encode($wtResult->{$stepName}{'val'}) if FL_WIDE_UTF8_TO_BYTES;
+        unless (
+          $wtResult->{$stepName}{'ok'} = 
+          +(
+            $wtResult->{$stepName}{'val'} =
+              $wtStep->{'checks'}
+                ? run_content_checks($wtStep->{'checks'}, $res)
+                : ( ($wtStep->{'code'} && $res->code && $res->code eq $wtStep->{'code'}) || (!$wtStep->{'code'} && $res->is_success) )
+                  ? 'OK'
+                  : sprintf('ERROR %d%s', $res->code, $res->message ? ': ' . $res->message : '')
+          ) eq 'OK' 
+            ? WT_STEP_STATUS_SUCCESS
+            : WT_STEP_STATUS_FAILURE
+        ) {
+          say STDERR $wtResult->{$stepName}{'ok'} if $pars->{'debug'};
+          last
+        }
+        utf8::encode( $wtResult->{$stepName}{'val'} ) if FL_WIDE_UTF8_TO_BYTES;
       }
-      $wtResult->{$_->{'name'}}{'val'}='UNKNOWN' for @wtSteps[($step_n+1)..$#wtSteps];
-      $wtAllRes{$wt->{'name'}}=$wtResult;
+      for ( @wtSteps[($step_n+1)..$#wtSteps] ) {
+        @{ $wtResult->{$_->{'name'}} }{qw/val ok/} = ( 'UNKNOWN', WT_STEP_STATUS_UNKNOWN )
+      }
+      $wtAllRes{ $wt->{'name'} } = $wtResult;
     }
     delete @{$where}{qw/test step/};
-    my $tsNow=int(time);
-    while (my ($wtName, $wtRes)=each %wtAllRes) {
-      while (my ($wtStepName, $wtStepRes)=each %{$wtRes}) {
-        $Z->bulk_buf_add([sprintf(WT_STEP_KEY_FMT, $_, $wtName, $wtStepName), $wtStepRes->{$_}, $tsNow])
-          for grep defined $wtStepRes->{$_}, qw(ok time val);
+    my $tsNow = int(time);
+    while ( my ($wtName, $wtRes) = each %wtAllRes ) {
+      while ( my ($wtStepName, $wtStepRes) = each $wtRes ) {
+        for ( grep defined( $wtStepRes->{$_} ), qw(ok time val) ) {
+          $Z->bulk_buf_add([
+            sprintf(WT_STEP_KEY_FMT, $_, $wtName, $wtStepName),
+            $wtStepRes->{$_},
+            $tsNow
+          ])
+        }
       }
     }
     $Z->bulk_send if @{$Z->bulk_buf};
@@ -287,9 +308,9 @@ use Getopt::Long::Descriptive;
 use Data::Dumper;
 
 use constant {
-  ZA_CONF=>'/etc/zabbix/zabbix_agentd.conf',
-  DFLT_SCENARIO_FILE=>'/etc/zabbix/wt/checks.pl',
-  DFLT_WEB_TESTS_DIR=>'/etc/zabbix/wt',
+  ZA_CONF		=> '/etc/zabbix/zabbix_agentd.conf',
+  DFLT_SCENARIO_FILE	=> '/etc/zabbix/wt/checks.pl',
+  DFLT_WEB_TESTS_DIR	=> '/etc/zabbix/wt',
 };
 
 open my $fhZAConf, '<', ZA_CONF or die 'Cant open '.ZA_CONF.': '.$!;
